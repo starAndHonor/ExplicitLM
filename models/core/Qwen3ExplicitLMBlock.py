@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer,
     Qwen3Config,
     Cache,
 )
@@ -18,6 +17,7 @@ from typing import Unpack
 from models.memory_bank.MemoryGate import MemoryGate
 from models.memory_bank.GatedMemoryFusion import GatedMemoryFusion
 from models.layers.RMSNorm import RMSNorm
+from models.core.Qwen3ExplicitDecoderLayer import Qwen3ExplicitDecoderLayer
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,8 @@ class Qwen3ExplicitLMBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.use_moe = memory_cfg.get("use_moe", False)
         
-        # 基础Transformer层
-        self.qwen3_decoder = Qwen3DecoderLayer(config, layer_idx)
+        # 基础Transformer层（融合位置前移：在 Attention 与 FFN 之间插入）
+        self.qwen3_decoder = Qwen3ExplicitDecoderLayer(config, layer_idx)
         
         if not self.use_moe:
             self._init_memory_components(config, memory_cfg, shared_memory_gate)
@@ -453,7 +453,36 @@ class Qwen3ExplicitLMBlock(nn.Module):
         Returns:
             (output, similarity_loss, layer_stats, cosine_stats)
         """
-        # 1. Transformer前向
+        if self.use_moe:
+            # MoE模式：不启用记忆融合
+            hidden_states = self.qwen3_decoder(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            zero_loss = torch.tensor(0.0, device=hidden_states.device, requires_grad=False)
+            return hidden_states, zero_loss, {}, {}
+
+        selection_cache: Dict[str, Union[torch.Tensor, MemorySelectionResult]] = {}
+
+        def memory_fusion(attn_hidden_states: torch.Tensor) -> torch.Tensor:
+            # 记忆检索在 Attention 与 FFN 之间进行
+            h_for_memory = self.memory_norm(attn_hidden_states)
+            candidate_indices, candidate_scores = self.memory_gate(h_for_memory)
+            selection_result = self._select_memory(
+                h_for_memory, candidate_indices, candidate_scores,
+                memory_bank, tok_embeddings, valid_mask
+            )
+            selection_cache["h_for_memory"] = h_for_memory
+            selection_cache["selection_result"] = selection_result
+            return self._fuse_memory(attn_hidden_states, h_for_memory, selection_result)
+
+        # 1. Transformer前向（Attention -> 记忆融合 -> FFN，融合位置前移）
         hidden_states = self.qwen3_decoder(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -462,36 +491,17 @@ class Qwen3ExplicitLMBlock(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            memory_fusion=memory_fusion,
             **kwargs,
         )
-        
-        # 2. MoE模式或无记忆模式：直接返回
-        if self.use_moe:
-            zero_loss = torch.tensor(0.0, device=hidden_states.device, requires_grad=False)
-            return hidden_states, zero_loss, {}, {}
-        
-        # 3. 记忆检索模式
-        h_for_memory = self.memory_norm(hidden_states)
-        
-        # 4. 获取候选
-        candidate_indices, candidate_scores = self.memory_gate(h_for_memory)
-        
-        # 5. 选择记忆
-        selection_result = self._select_memory(
-            h_for_memory, candidate_indices, candidate_scores,
-            memory_bank, tok_embeddings, valid_mask
-        )
-        
-        # 6. 融合记忆
-        output = self._fuse_memory(hidden_states, h_for_memory, selection_result)
-        
-        # 7. 计算损失
+
+        # 2. 计算损失与统计（基于 Attention 后的状态）
+        selection_result = selection_cache["selection_result"]
+        h_for_memory = selection_cache["h_for_memory"]
         similarity_loss = self._compute_memory_loss(
-            h_for_memory, selection_result, memory_bank, 
+            h_for_memory, selection_result, memory_bank,
             tok_embeddings, valid_mask
         )
-        
-        # 8. 统计信息（仅训练时）
         layer_stats, cosine_stats = self._compute_stats(selection_result)
-        
-        return output, similarity_loss, layer_stats, cosine_stats
+
+        return hidden_states, similarity_loss, layer_stats, cosine_stats
