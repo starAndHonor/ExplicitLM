@@ -1,6 +1,7 @@
 # ExplicitLM
 
 基于 Qwen3-4B 的显式记忆增强语言模型。通过 Product Key Memory (PKM) 机制实现知识的显式存储和检索。
+当前实现将记忆融合插入在每层 Attention 之后、FFN 之前。
 
 ## 环境配置
 
