@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer,
     Qwen3Config,
     Cache,
 )
@@ -18,6 +17,7 @@ from typing import Unpack
 from models.memory_bank.MemoryGate import MemoryGate
 from models.memory_bank.GatedMemoryFusion import GatedMemoryFusion
 from models.layers.RMSNorm import RMSNorm
+from models.core.Qwen3ExplicitDecoderLayer import Qwen3ExplicitDecoderLayer
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,8 @@ class Qwen3ExplicitLMBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.use_moe = memory_cfg.get("use_moe", False)
         
-        # 基础Transformer层
-        self.qwen3_decoder = Qwen3DecoderLayer(config, layer_idx)
+        # 基础Transformer层（在 Attention 与 FFN 之间插入记忆融合）
+        self.qwen3_decoder = Qwen3ExplicitDecoderLayer(config, layer_idx)
         
         if not self.use_moe:
             self._init_memory_components(config, memory_cfg, shared_memory_gate)
@@ -463,7 +463,84 @@ class Qwen3ExplicitLMBlock(nn.Module):
         Returns:
             (output, similarity_loss, layer_stats, cosine_stats)
         """
-        # 1. Transformer前向
+        # 1. MoE模式或无记忆模式：直接返回
+        if self.use_moe:
+            hidden_states = self.qwen3_decoder(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                memory_fusion=None,
+                **kwargs,
+            )
+            zero_loss = torch.tensor(0.0, device=hidden_states.device, requires_grad=False)
+            return hidden_states, zero_loss, {}, {}
+
+        # 2. 记忆融合逻辑插入 Attention 之后、FFN 之前
+        similarity_loss = torch.tensor(0.0, device=hidden_states.device)
+        layer_stats: Dict[str, float] = {}
+        cosine_stats: Dict[str, Union[torch.Tensor, float]] = {}
+
+        def memory_fusion_fn(attn_hidden_states: torch.Tensor) -> torch.Tensor:
+            nonlocal similarity_loss, layer_stats, cosine_stats
+            h_for_memory = self.memory_norm(attn_hidden_states)
+
+            # 如果提供了 forced_memory_tokens，直接使用（跳过检索）
+            if forced_memory_tokens is not None:
+                bsz, seq_len, _ = h_for_memory.shape
+                device = h_for_memory.device
+
+                if tok_embeddings is None:
+                    raise ValueError("forced_memory_tokens 需要 tok_embeddings")
+
+                pad_token_id = 0
+                memory_embeddings = tok_embeddings(forced_memory_tokens)
+                attention_mask = (forced_memory_tokens != pad_token_id).long()
+                mask = attention_mask.unsqueeze(-1).to(dtype=memory_embeddings.dtype)
+                sum_hidden = (memory_embeddings * mask).sum(dim=1)
+                len_hidden = mask.sum(dim=1).clamp(min=1e-6)
+                selected_memory_flat = sum_hidden / len_hidden
+
+                selected_memory = selected_memory_flat.unsqueeze(1).expand(-1, seq_len, -1)
+
+                selection_result = MemorySelectionResult(
+                    selected_memory=selected_memory,
+                    selection_weights=torch.ones(bsz, seq_len, 1, device=device, dtype=selected_memory.dtype),
+                    selected_indices=torch.zeros(bsz, seq_len, dtype=torch.long, device=device),
+                    actual_memory_indices=torch.zeros(bsz, seq_len, dtype=torch.long, device=device),
+                    similarity_scores=torch.zeros(bsz, seq_len, 1, device=device, dtype=selected_memory.dtype),
+                    selected_similarities=torch.zeros(bsz, seq_len, device=device, dtype=selected_memory.dtype),
+                )
+
+                similarity_loss = torch.tensor(0.0, device=device, requires_grad=False)
+                layer_stats, cosine_stats = self._compute_stats(selection_result)
+                return self._fuse_memory(attn_hidden_states, h_for_memory, selection_result)
+
+            # 正常检索模式
+            if precomputed_candidates is not None:
+                candidate_indices, candidate_scores = precomputed_candidates
+            else:
+                candidate_indices, candidate_scores = self.memory_gate(
+                    h_for_memory, memory_bank, tok_embeddings, valid_mask
+                )
+
+            selection_result = self._select_memory(
+                h_for_memory, candidate_indices, candidate_scores,
+                memory_bank, tok_embeddings, valid_mask
+            )
+
+            output = self._fuse_memory(attn_hidden_states, h_for_memory, selection_result)
+            similarity_loss = self._compute_memory_loss(
+                h_for_memory, selection_result, memory_bank,
+                tok_embeddings, valid_mask
+            )
+            layer_stats, cosine_stats = self._compute_stats(selection_result)
+            return output
+
+        # 3. Transformer前向（融合发生在 Attention 与 FFN 之间）
         hidden_states = self.qwen3_decoder(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -472,86 +549,8 @@ class Qwen3ExplicitLMBlock(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            memory_fusion=memory_fusion_fn,
             **kwargs,
         )
-        
-        # 2. MoE模式或无记忆模式：直接返回
-        if self.use_moe:
-            zero_loss = torch.tensor(0.0, device=hidden_states.device, requires_grad=False)
-            return hidden_states, zero_loss, {}, {}
-        
-        # 3. 记忆检索模式
-        h_for_memory = self.memory_norm(hidden_states)
-        
-        # 4. 如果提供了 forced_memory_tokens，直接使用（跳过检索）
-        if forced_memory_tokens is not None:
-            # forced_memory_tokens: [batch, knowledge_length]
-            bsz, seq_len, hidden_size = h_for_memory.shape
-            device = h_for_memory.device
-            
-            # 将 tokens 转换为 embeddings
-            if tok_embeddings is None:
-                raise ValueError("forced_memory_tokens 需要 tok_embeddings")
-            
-            # 计算 mean pooling（考虑 pad tokens）
-            pad_token_id = 0
-            memory_embeddings = tok_embeddings(forced_memory_tokens)  # [batch, knowledge_length, hidden_size]
-            attention_mask = (forced_memory_tokens != pad_token_id).long()  # [batch, knowledge_length]
-            mask = attention_mask.unsqueeze(-1).to(dtype=memory_embeddings.dtype)  # [batch, knowledge_length, 1]
-            sum_hidden = (memory_embeddings * mask).sum(dim=1)  # [batch, hidden_size]
-            len_hidden = mask.sum(dim=1).clamp(min=1e-6)  # [batch, 1]
-            selected_memory_flat = sum_hidden / len_hidden  # [batch, hidden_size]
-            
-            # 广播到 [batch, seq_len, hidden_size]
-            selected_memory = selected_memory_flat.unsqueeze(1).expand(-1, seq_len, -1)
-            
-            # 构造假的 selection_result
-            selection_result = MemorySelectionResult(
-                selected_memory=selected_memory,
-                selection_weights=torch.ones(bsz, seq_len, 1, device=device, dtype=selected_memory.dtype),  # [batch, seq_len, 1]
-                selected_indices=torch.zeros(bsz, seq_len, dtype=torch.long, device=device),  # [batch, seq_len]
-                actual_memory_indices=torch.zeros(bsz, seq_len, dtype=torch.long, device=device),  # [batch, seq_len]
-                similarity_scores=torch.zeros(bsz, seq_len, 1, device=device, dtype=selected_memory.dtype),  # [batch, seq_len, 1]
-                selected_similarities=torch.zeros(bsz, seq_len, device=device, dtype=selected_memory.dtype),  # [batch, seq_len]
-            )
-            
-            # 融合记忆
-            output = self._fuse_memory(hidden_states, h_for_memory, selection_result)
-            
-            # 损失设为 0（因为不进行检索，无法计算相似度损失）
-            similarity_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            
-            # 统计信息
-            layer_stats, cosine_stats = self._compute_stats(selection_result)
-            
-            return output, similarity_loss, layer_stats, cosine_stats
-        
-        # 5. 正常检索模式（原有逻辑）
-        # 获取候选（如果提供了预计算的检索结果，则直接使用；否则进行检索）
-        if precomputed_candidates is not None:
-            candidate_indices, candidate_scores = precomputed_candidates
-        else:
-            # 获取候选（直接 RAG 相似度查找）
-            candidate_indices, candidate_scores = self.memory_gate(
-                h_for_memory, memory_bank, tok_embeddings, valid_mask
-            )
-        
-        # 6. 选择记忆
-        selection_result = self._select_memory(
-            h_for_memory, candidate_indices, candidate_scores,
-            memory_bank, tok_embeddings, valid_mask
-        )
-        
-        # 7. 融合记忆
-        output = self._fuse_memory(hidden_states, h_for_memory, selection_result)
-        
-        # 8. 计算损失
-        similarity_loss = self._compute_memory_loss(
-            h_for_memory, selection_result, memory_bank, 
-            tok_embeddings, valid_mask
-        )
-        
-        # 9. 统计信息（仅训练时）
-        layer_stats, cosine_stats = self._compute_stats(selection_result)
-        
-        return output, similarity_loss, layer_stats, cosine_stats
+
+        return hidden_states, similarity_loss, layer_stats, cosine_stats
